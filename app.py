@@ -123,7 +123,6 @@ def run_strategy(df, strategy, capital, stop_loss_pct, enable_range_stop):
     return df, final_asset, history, (buy_x, buy_y, sell_x, sell_y)
 
 # --- 2. 側邊欄 (輸入區) ---
-# --- 2. 側邊欄 (輸入區) ---
 st.sidebar.title("🎛️ 控制台")
 
 # 定義一個 callback 函數，當輸入框改變時執行
