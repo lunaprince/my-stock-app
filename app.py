@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 from datetime import date, timedelta
 
 # --- 頁面設定 ---
-st.set_page_config(page_title="全能股市指揮官", layout="wide")
+st.set_page_config(page_title="全能股市", layout="wide")
 
 # --- 0. 輔助函式 ---
 def get_stock_name(code):
@@ -123,7 +123,7 @@ def run_strategy(df, strategy, capital, stop_loss_pct, enable_range_stop):
     return df, final_asset, history, (buy_x, buy_y, sell_x, sell_y)
 
 # --- 2. 側邊欄 (輸入區) ---
-st.sidebar.title("🎛️ 指揮官控制台")
+st.sidebar.title("🎛️ 控制台")
 
 stock_input = st.sidebar.text_input("股票代碼", value="2382", max_chars=10)
 stock_name = get_stock_name(stock_input)
@@ -152,9 +152,9 @@ if has_position:
     my_cost = st.sidebar.number_input("持有成本", value=0.0)
 
 # --- 3. 主畫面 (執行與顯示) ---
-st.title(f"📊 全能股市指揮官 - {stock_name}")
+st.title(f"📊 全能股市 - {stock_name}")
 
-if st.sidebar.button("🚀 執行戰略分析", type="primary"):
+if st.sidebar.button("🚀 執行分析", type="primary"):
     with st.spinner('正在連線交易所抓取數據...'):
         df = get_data(stock_input, start_date)
     
@@ -197,7 +197,7 @@ if st.sidebar.button("🚀 執行戰略分析", type="primary"):
         st.plotly_chart(fig, use_container_width=True)
         
         # --- C. 明日戰術指引 ---
-        st.subheader("📋 指揮官戰術報告")
+        st.subheader("📋 預測報告")
         last = df.iloc[-1]
         curr_price = last['CLOSE' if 'CLOSE' in df.columns else 'ADJCLOSE']
         
