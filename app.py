@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from datetime import date, timedelta
-import twstock
 
 # --- 頁面設定 ---
 st.set_page_config(page_title="全能股市指揮官", layout="wide")
