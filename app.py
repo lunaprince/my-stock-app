@@ -123,11 +123,28 @@ def run_strategy(df, strategy, capital, stop_loss_pct, enable_range_stop):
     return df, final_asset, history, (buy_x, buy_y, sell_x, sell_y)
 
 # --- 2. 側邊欄 (輸入區) ---
+# --- 2. 側邊欄 (輸入區) ---
 st.sidebar.title("🎛️ 控制台")
 
-stock_input = st.sidebar.text_input("股票代碼", value="2382", max_chars=10)
-stock_name = get_stock_name(stock_input)
-st.sidebar.markdown(f"**目前標的：{stock_input} {stock_name}**")
+# 定義一個 callback 函數，當輸入框改變時執行
+def update_name():
+    st.session_state.stock_name = get_stock_name(st.session_state.stock_input)
+
+# 輸入框綁定 key 和 on_change
+stock_input = st.sidebar.text_input(
+    "股票代碼", 
+    value="2382", 
+    max_chars=10, 
+    key="stock_input", 
+    on_change=update_name
+)
+
+# 初始化 session_state (第一次執行時)
+if 'stock_name' not in st.session_state:
+    st.session_state.stock_name = get_stock_name("2382")
+
+# 顯示目前標的 (直接讀取最新的 state)
+st.sidebar.info(f"目前標的：{stock_input} {st.session_state.stock_name}")
 
 strategy = st.sidebar.radio("選擇戰略", ["🟢 趨勢 (MA10/60)", "🔴 區間 (KD逆勢)", "🟡 衝浪 (MACD+MA20)"])
 
