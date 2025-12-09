@@ -12,7 +12,6 @@ try:
 except ImportError:
     HAS_TWSTOCK = False
 
-# --- 頁面設定 ---
 st.set_page_config(page_title="全能股市指揮官", layout="wide")
 
 # --- 0. 輔助函式 ---
@@ -23,24 +22,25 @@ def get_stock_name(code):
             if clean_code in twstock.codes:
                 return twstock.codes[clean_code].name
         except: pass
-    
     try:
-        if not code.endswith('.TW') and not code.endswith('.TWO'):
-            ticker = yf.Ticker(code + '.TW')
-        else:
-            ticker = yf.Ticker(code)
+        ticker = yf.Ticker(code if code.endswith('.TW') else code + '.TW')
         return ticker.info.get('shortName', code)
-    except:
-        return code
+    except: return code
 
 @st.cache_data(ttl=3600)
 def get_data(stock_code, start_date):
     if not stock_code.endswith('.TW') and not stock_code.endswith('.TWO'):
         stock_code += '.TW'
+        
+    # --- 關鍵修正：日期防呆 ---
+    # 如果選的日期距離今天少於 90 天，自動往前推，確保能算出 MA60
+    days_diff = (date.today() - start_date).days
+    if days_diff < 90:
+        start_date = date.today() - timedelta(days=180)
+        
     try:
         df = yf.download(stock_code, start=start_date, progress=False)
         if df.empty: return None
-        
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         df.columns = [col.upper().replace('ADJ CLOSE', 'ADJCLOSE') for col in df.columns]
         target_col = 'CLOSE' if 'CLOSE' in df.columns else 'ADJCLOSE'
@@ -50,17 +50,16 @@ def get_data(stock_code, start_date):
 
 # --- 1. 策略邏輯 ---
 def run_strategy(df, strategy, capital, stop_loss_pct, enable_range_stop):
-    # 關鍵修正：如果本金是 0，強制設為 1 元避免除以零，或者設為一個極小值
-    if capital <= 0: capital = 10000 # 預設一萬
-
+    if capital <= 0: capital = 10000 
     target = 'CLOSE' if 'CLOSE' in df.columns else 'ADJCLOSE'
     
+    # 指標計算
     df['MA10'] = df[target].rolling(10).mean()
     df['MA20'] = df[target].rolling(20).mean()
     df['MA60'] = df[target].rolling(60).mean()
     
-    low_min = df['LOW'].rolling(9).min()
-    high_max = df['HIGH'].rolling(9).max()
+    # KD
+    low_min = df['LOW'].rolling(9).min(); high_max = df['HIGH'].rolling(9).max()
     rsv = 100 * ((df[target] - low_min) / (high_max - low_min)).fillna(50)
     k_list = []; k=50
     for r in rsv:
@@ -68,8 +67,8 @@ def run_strategy(df, strategy, capital, stop_loss_pct, enable_range_stop):
     df['K'] = k_list
     df['Box_Low'] = df['LOW'].rolling(60).min()
 
-    exp12 = df[target].ewm(span=12).mean()
-    exp26 = df[target].ewm(span=26).mean()
+    # MACD
+    exp12 = df[target].ewm(span=12).mean(); exp26 = df[target].ewm(span=26).mean()
     df['DIF'] = exp12 - exp26
     df['DEM'] = df['DIF'].ewm(span=9).mean()
     df['MACD_Hist'] = df['DIF'] - df['DEM']
@@ -118,7 +117,6 @@ def run_strategy(df, strategy, capital, stop_loss_pct, enable_range_stop):
             sell_x.append(d); sell_y.append(p)
             position = 0
         elif signal_buy and position == 0:
-            # 這裡也要防呆，如果股價是 0 (雖然不可能)
             if p > 0:
                 position = int(equity / (p * 1.001425))
                 if position > 0:
@@ -134,7 +132,6 @@ def run_strategy(df, strategy, capital, stop_loss_pct, enable_range_stop):
 # --- 2. 側邊欄 ---
 st.sidebar.title("🎛️ 指揮官控制台")
 
-# 使用 Session State 處理輸入與名稱更新
 if 'stock_name' not in st.session_state:
     st.session_state.stock_name = ""
 
@@ -143,7 +140,6 @@ def update_name():
 
 stock_input = st.sidebar.text_input("股票代碼", value="2382", max_chars=10, key="stock_input", on_change=update_name)
 
-# 初次執行也要抓一次名字
 if st.session_state.stock_name == "":
     st.session_state.stock_name = get_stock_name(stock_input)
 
@@ -185,13 +181,16 @@ if st.session_state.run_analysis:
         df = get_data(stock_input, start_date)
     
     if df is not None:
-        # 防呆：確保本金不為 0
-        safe_capital = capital if capital > 0 else 1 # 如果是0，用1塊錢算，避免報錯
-        
+        # 檢查日期是否有被自動調整
+        real_start_date = df.index[0].date()
+        days_diff = (real_start_date - start_date).days
+        if abs(days_diff) > 5: # 如果實際資料日期跟使用者選的差太多
+             st.warning(f"⚠️ 提示：為確保指標計算 (MA60)，已自動為您抓取足夠的歷史數據。 (資料起始日：{real_start_date})")
+
+        safe_capital = capital if capital > 0 else 1 
         df, final_asset, history, signals = run_strategy(df, strategy, safe_capital, stop_loss, enable_range_stop)
         buy_x, buy_y, sell_x, sell_y = signals
         
-        # 計算績效 (分母使用 safe_capital)
         total_ret = (final_asset - safe_capital) / safe_capital * 100
         net_profit = final_asset - safe_capital
         
