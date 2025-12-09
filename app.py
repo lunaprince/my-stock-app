@@ -5,8 +5,7 @@ import numpy as np
 import plotly.graph_objects as go
 from datetime import date, timedelta
 
-# --- 關鍵修正 1：安全導入 twstock ---
-# 如果伺服器沒裝 twstock，不會當機，而是自動切換成備用模式
+# --- 安全導入 twstock ---
 try:
     import twstock
     HAS_TWSTOCK = True
@@ -18,7 +17,6 @@ st.set_page_config(page_title="全能股市指揮官", layout="wide")
 
 # --- 0. 輔助函式 ---
 def get_stock_name(code):
-    # 嘗試抓取中文名
     if HAS_TWSTOCK:
         try:
             clean_code = code.replace('.TW', '').replace('.TWO', '')
@@ -26,14 +24,11 @@ def get_stock_name(code):
                 return twstock.codes[clean_code].name
         except: pass
     
-    # 備案：嘗試用 yfinance 抓簡稱
     try:
         if not code.endswith('.TW') and not code.endswith('.TWO'):
-            # 暫時修正代碼格式以利查詢
             ticker = yf.Ticker(code + '.TW')
         else:
             ticker = yf.Ticker(code)
-        # 嘗試獲取名稱，若失敗回傳代碼
         return ticker.info.get('shortName', code)
     except:
         return code
@@ -55,13 +50,15 @@ def get_data(stock_code, start_date):
 
 # --- 1. 策略邏輯 ---
 def run_strategy(df, strategy, capital, stop_loss_pct, enable_range_stop):
+    # 關鍵修正：如果本金是 0，強制設為 1 元避免除以零，或者設為一個極小值
+    if capital <= 0: capital = 10000 # 預設一萬
+
     target = 'CLOSE' if 'CLOSE' in df.columns else 'ADJCLOSE'
     
     df['MA10'] = df[target].rolling(10).mean()
     df['MA20'] = df[target].rolling(20).mean()
     df['MA60'] = df[target].rolling(60).mean()
     
-    # KD
     low_min = df['LOW'].rolling(9).min()
     high_max = df['HIGH'].rolling(9).max()
     rsv = 100 * ((df[target] - low_min) / (high_max - low_min)).fillna(50)
@@ -71,7 +68,6 @@ def run_strategy(df, strategy, capital, stop_loss_pct, enable_range_stop):
     df['K'] = k_list
     df['Box_Low'] = df['LOW'].rolling(60).min()
 
-    # MACD
     exp12 = df[target].ewm(span=12).mean()
     exp26 = df[target].ewm(span=26).mean()
     df['DIF'] = exp12 - exp26
@@ -122,26 +118,36 @@ def run_strategy(df, strategy, capital, stop_loss_pct, enable_range_stop):
             sell_x.append(d); sell_y.append(p)
             position = 0
         elif signal_buy and position == 0:
-            position = int(equity / (p * 1.001425))
-            if position > 0:
-                equity -= position * p * 1.001425
-                buy_price = p
-                history.append(f"{d.date()} 買進 {p:.1f}")
-                buy_x.append(d); buy_y.append(p)
+            # 這裡也要防呆，如果股價是 0 (雖然不可能)
+            if p > 0:
+                position = int(equity / (p * 1.001425))
+                if position > 0:
+                    equity -= position * p * 1.001425
+                    buy_price = p
+                    history.append(f"{d.date()} 買進 {p:.1f}")
+                    buy_x.append(d); buy_y.append(p)
 
     final_asset = equity
     if position > 0: final_asset += position * prices[-1] * 0.995575
     return df, final_asset, history, (buy_x, buy_y, sell_x, sell_y)
 
-# --- 2. 側邊欄 (輸入區) ---
+# --- 2. 側邊欄 ---
 st.sidebar.title("🎛️ 指揮官控制台")
 
-# 這裡改進了：輸入後按 Enter 才會更新，減少閃爍
-stock_input = st.sidebar.text_input("股票代碼", value="2382", max_chars=10)
+# 使用 Session State 處理輸入與名稱更新
+if 'stock_name' not in st.session_state:
+    st.session_state.stock_name = ""
 
-# 即時抓取名稱顯示
-stock_name = get_stock_name(stock_input)
-st.sidebar.success(f"目前標的：{stock_name} ({stock_input})")
+def update_name():
+    st.session_state.stock_name = get_stock_name(st.session_state.stock_input)
+
+stock_input = st.sidebar.text_input("股票代碼", value="2382", max_chars=10, key="stock_input", on_change=update_name)
+
+# 初次執行也要抓一次名字
+if st.session_state.stock_name == "":
+    st.session_state.stock_name = get_stock_name(stock_input)
+
+st.sidebar.info(f"目前標的：{stock_input} {st.session_state.stock_name}")
 
 strategy = st.sidebar.radio("選擇戰略", ["🟢 趨勢 (MA10/60)", "🔴 區間 (KD逆勢)", "🟡 衝浪 (MACD+MA20)"])
 
@@ -163,7 +169,6 @@ my_cost = 0.0
 if has_position:
     my_cost = st.sidebar.number_input("持有成本", value=0.0)
 
-# --- 關鍵修正 2：按鈕狀態記憶 (Session State) ---
 if 'run_analysis' not in st.session_state:
     st.session_state.run_analysis = False
 
@@ -175,25 +180,26 @@ st.sidebar.button("🚀 執行戰略分析", type="primary", on_click=execute_an
 # --- 3. 主畫面 ---
 st.title(f"📊 全能股市指揮官")
 
-# 只有當按鈕被按過 (Session State 為 True) 才顯示內容
 if st.session_state.run_analysis:
     with st.spinner('正在連線交易所抓取數據...'):
         df = get_data(stock_input, start_date)
     
     if df is not None:
-        df, final_asset, history, signals = run_strategy(df, strategy, capital, stop_loss, enable_range_stop)
+        # 防呆：確保本金不為 0
+        safe_capital = capital if capital > 0 else 1 # 如果是0，用1塊錢算，避免報錯
+        
+        df, final_asset, history, signals = run_strategy(df, strategy, safe_capital, stop_loss, enable_range_stop)
         buy_x, buy_y, sell_x, sell_y = signals
         
-        total_ret = (final_asset - capital) / capital * 100
-        net_profit = final_asset - capital
+        # 計算績效 (分母使用 safe_capital)
+        total_ret = (final_asset - safe_capital) / safe_capital * 100
+        net_profit = final_asset - safe_capital
         
-        # A. 績效看板
-        c1, c2, c3 = st.columns(3)
-        c1.metric("最終資產", f"${final_asset:,.0f}")
-        c2.metric("總損益", f"${net_profit:,.0f}", f"{total_ret:.2f}%")
-        c3.metric("總交易次數", f"{len(history)//2} 次")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("最終資產", f"${final_asset:,.0f}")
+        col2.metric("總損益", f"${net_profit:,.0f}", f"{total_ret:.2f}%")
+        col3.metric("總交易次數", f"{len(history)//2} 次")
         
-        # B. 互動圖表
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df.index, y=df['CLOSE' if 'CLOSE' in df.columns else 'ADJCLOSE'], 
                                  mode='lines', name='股價', line=dict(color='gray', width=1)))
@@ -209,10 +215,9 @@ if st.session_state.run_analysis:
         fig.add_trace(go.Scatter(x=buy_x, y=buy_y, mode='markers', name='買進', marker=dict(symbol='triangle-up', size=10, color='red')))
         fig.add_trace(go.Scatter(x=sell_x, y=sell_y, mode='markers', name='賣出', marker=dict(symbol='triangle-down', size=10, color='green')))
 
-        fig.update_layout(title=f"{stock_name} ({stock_input}) - {strategy}", height=600, xaxis_rangeslider_visible=True)
+        fig.update_layout(title=f"{st.session_state.stock_name} ({stock_input}) - {strategy}", height=600, xaxis_rangeslider_visible=True)
         st.plotly_chart(fig, use_container_width=True)
         
-        # C. 戰術指引
         st.subheader("📋 指揮官戰術報告")
         last = df.iloc[-1]
         curr_price = last['CLOSE' if 'CLOSE' in df.columns else 'ADJCLOSE']
