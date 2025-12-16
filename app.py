@@ -13,10 +13,10 @@ try:
 except ImportError:
     HAS_TWSTOCK = False
 
-st.set_page_config(page_title="全能股市指揮官 V31", layout="wide")
+st.set_page_config(page_title="全能股市指揮官 V32 (分流版)", layout="wide")
 
 # ==========================================
-# 0. 輔助函式
+# 0. 核心數據引擎 (共用)
 # ==========================================
 def get_stock_name(code):
     if HAS_TWSTOCK:
@@ -30,14 +30,15 @@ def get_stock_name(code):
         return ticker.info.get('shortName', code)
     except: return code
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=300) 
 def get_data(stock_code, start_date):
     if not stock_code.endswith('.TW') and not stock_code.endswith('.TWO'):
         stock_code += '.TW'
     
-    # 日期防呆：若太近自動推算
+    # 自動補正日期：至少抓 180 天以確保 MA60 能計算
     days_diff = (date.today() - start_date).days
-    if days_diff < 90: start_date = date.today() - timedelta(days=180)
+    if days_diff < 180: 
+        start_date = date.today() - timedelta(days=200)
         
     try:
         df = yf.download(stock_code, start=start_date, progress=False)
@@ -50,13 +51,11 @@ def get_data(stock_code, start_date):
     except: return None
 
 # ==========================================
-# 1. 核心策略引擎 (整合四種邏輯)
+# 1. 策略計算引擎 (共用)
 # ==========================================
-def run_strategy(df, strategy, capital, stop_loss_pct, take_profit_pct, enable_range_stop):
-    if capital <= 0: capital = 10000 
+def calculate_indicators(df):
     target = 'CLOSE' if 'CLOSE' in df.columns else 'ADJCLOSE'
-    
-    # --- 計算所有指標 ---
+    # 均線
     df['MA10'] = df[target].rolling(10).mean()
     df['MA20'] = df[target].rolling(20).mean()
     df['MA60'] = df[target].rolling(60).mean()
@@ -68,28 +67,32 @@ def run_strategy(df, strategy, capital, stop_loss_pct, take_profit_pct, enable_r
     for r in rsv:
         k = (2/3)*k + (1/3)*r; k_list.append(k)
     df['K'] = k_list
-    df['Box_Low'] = df['LOW'].rolling(60).min() # 區間防守線
+    df['Box_Low'] = df['LOW'].rolling(60).min()
 
     # MACD
     exp12 = df[target].ewm(span=12).mean(); exp26 = df[target].ewm(span=26).mean()
     df['DIF'] = exp12 - exp26
     df['DEM'] = df['DIF'].ewm(span=9).mean()
     df['MACD_Hist'] = df['DIF'] - df['DEM']
+    return df
 
-    # --- 回測變數 ---
+def run_backtest(df, strategy, capital, stop_loss_pct, take_profit_pct, enable_range_stop):
+    if capital <= 0: capital = 10000 
+    target = 'CLOSE' if 'CLOSE' in df.columns else 'ADJCLOSE'
+    
     position = 0; equity = capital; buy_price = 0
     buy_x, buy_y, sell_x, sell_y = [], [], [], []
     history = []
     prices = df[target].values; dates = df.index
+    
+    # 為了避免前面 NaN 造成誤判，從第 60 天開始跑
     start_idx = 60 
     
     for i in range(start_idx, len(df)):
         p = prices[i]; d = dates[i]
         signal_buy = False; signal_sell = False; reason = ""
         
-        # ==================== 策略分歧點 ====================
-        
-        # 🟢 趨勢 (Trend): MA10 黃金交叉
+        # --- 策略邏輯判斷 ---
         if "趨勢" in strategy:
             m10 = df['MA10'].iloc[i]; m60 = df['MA60'].iloc[i]
             if position > 0:
@@ -99,7 +102,6 @@ def run_strategy(df, strategy, capital, stop_loss_pct, take_profit_pct, enable_r
             elif position == 0:
                 if m10 > m60 and p > m60: signal_buy=True
 
-        # 🟣 快攻 (Breakout): 突破季線 + 停利 (V30功能)
         elif "快攻" in strategy:
             m60 = df['MA60'].iloc[i]; prev_p = prices[i-1]; prev_m60 = df['MA60'].iloc[i-1]
             if position > 0:
@@ -108,10 +110,8 @@ def run_strategy(df, strategy, capital, stop_loss_pct, take_profit_pct, enable_r
                 elif roi <= -stop_loss_pct/100: signal_sell=True; reason="停損"
                 elif p < m60: signal_sell=True; reason="跌破季線"
             elif position == 0:
-                # 股價由下往上穿越季線
                 if p > m60 and prev_p < prev_m60: signal_buy=True
                 
-        # 🔴 區間 (Range): KD 逆勢
         elif "區間" in strategy:
             k_val = df['K'].iloc[i]; box_low = df['Box_Low'].iloc[i-1]
             if position > 0:
@@ -120,7 +120,6 @@ def run_strategy(df, strategy, capital, stop_loss_pct, take_profit_pct, enable_r
             elif position == 0:
                 if k_val < 20: signal_buy=True
                 
-        # 🟡 衝浪 (Surfer): MACD 動能
         elif "衝浪" in strategy:
             ma20 = df['MA20'].iloc[i]; dif = df['DIF'].iloc[i]; dem = df['DEM'].iloc[i]
             prev_dif = df['DIF'].iloc[i-1]; prev_dem = df['DEM'].iloc[i-1]
@@ -131,7 +130,7 @@ def run_strategy(df, strategy, capital, stop_loss_pct, take_profit_pct, enable_r
                 gold_cross = (prev_dif < prev_dem) and (dif > dem)
                 if gold_cross: signal_buy=True
 
-        # ==================== 執行交易 ====================
+        # --- 執行交易 ---
         if signal_sell and position > 0:
             equity += position * p * 0.995575
             roi = (p - buy_price) / buy_price * 100
@@ -149,141 +148,167 @@ def run_strategy(df, strategy, capital, stop_loss_pct, take_profit_pct, enable_r
 
     final_asset = equity
     if position > 0: final_asset += position * prices[-1] * 0.995575
-    return df, final_asset, history, (buy_x, buy_y, sell_x, sell_y)
+    return final_asset, history, (buy_x, buy_y, sell_x, sell_y)
 
 # ==========================================
-# 2. 側邊欄 (輸入區)
+# 2. 介面佈局
 # ==========================================
-st.sidebar.title("🎛️ 四維戰略指揮官")
+st.sidebar.title("🎛️ 指揮官控制台 V32")
 
+# --- 側邊欄：全域設定 ---
 if 'stock_name' not in st.session_state: st.session_state.stock_name = ""
 def update_name(): st.session_state.stock_name = get_stock_name(st.session_state.stock_input)
 
 stock_input = st.sidebar.text_input("股票代碼", value="2382", max_chars=10, key="stock_input", on_change=update_name)
 if st.session_state.stock_name == "": st.session_state.stock_name = get_stock_name(stock_input)
-st.sidebar.info(f"目前標的：{stock_input} {st.session_state.stock_name}")
+st.sidebar.info(f"標的：{stock_input} {st.session_state.stock_name}")
 
-# 這裡增加了「快攻」選項
-strategy = st.sidebar.radio("選擇戰略", 
-    ["🟢 趨勢 (MA10/60)", "🟣 快攻 (突破+停利)", "🔴 區間 (KD逆勢)", "🟡 衝浪 (MACD+MA20)"])
+strategy = st.sidebar.radio("選擇戰略", ["🟢 趨勢 (MA10/60)", "🟣 快攻 (突破+停利)", "🔴 區間 (KD逆勢)", "🟡 衝浪 (MACD+MA20)"])
 
-with st.sidebar.expander("⚙️ 參數設定", expanded=True):
-    capital = st.number_input("初始本金", value=450000, step=10000)
-    start_date = st.date_input("回測開始日", value=date(2020, 1, 1))
-    
+# 策略參數放在側邊欄，因為這會影響兩個分頁的判斷
+with st.sidebar.expander("⚙️ 策略參數微調", expanded=True):
     stop_loss = 8.0
     take_profit = 20.0
     enable_range_stop = False
     
-    # 根據策略顯示不同的滑桿
-    if "趨勢" in strategy:
-        stop_loss = st.slider("停損 %", 2.0, 20.0, 8.0)
+    if "趨勢" in strategy: stop_loss = st.slider("停損 %", 2.0, 20.0, 8.0)
     elif "快攻" in strategy:
         stop_loss = st.slider("停損 %", 2.0, 20.0, 8.0)
         take_profit = st.slider("🎯 停利目標 %", 5.0, 100.0, 20.0)
-    elif "區間" in strategy:
-        enable_range_stop = st.checkbox("啟用破底停損", value=False)
+    elif "區間" in strategy: enable_range_stop = st.checkbox("啟用破底停損", value=False)
 
 st.sidebar.divider()
-has_position = st.sidebar.checkbox("我目前持有庫存")
-my_cost = 0.0
-if has_position:
-    my_cost = st.sidebar.number_input("持有成本", value=0.0)
-
-if 'run_analysis' not in st.session_state: st.session_state.run_analysis = False
-def execute_analysis(): st.session_state.run_analysis = True
-st.sidebar.button("🚀 執行戰略分析", type="primary", on_click=execute_analysis)
+st.sidebar.caption("Designed by Gemini for Commander")
 
 # ==========================================
-# 3. 主畫面
+# 3. 主畫面：分頁系統
 # ==========================================
-st.title(f"📊 全能股市指揮官 V31")
+st.title(f"📊 全能股市指揮官")
 
-if st.session_state.run_analysis:
-    with st.spinner('正在連線交易所...'):
-        df = get_data(stock_input, start_date)
+# 建立兩個分頁
+tab1, tab2 = st.tabs(["⚔️ 今日戰情 (操作)", "🧪 歷史回測 (研究)"])
+
+# ------------------------------------------------------------------
+# 分頁 1: 今日戰情 (只看結果，不看過程)
+# ------------------------------------------------------------------
+with tab1:
+    st.header(f"⚔️ {st.session_state.stock_name} ({stock_input}) - 戰術執行面板")
     
-    if df is not None:
-        safe_capital = capital if capital > 0 else 1 
-        df, final_asset, history, signals = run_strategy(df, strategy, safe_capital, stop_loss, take_profit, enable_range_stop)
-        buy_x, buy_y, sell_x, sell_y = signals
+    col_pos, col_cost = st.columns(2)
+    has_position = col_pos.checkbox("✅ 我目前持有庫存 (勾選以啟動監控)", value=False)
+    my_cost = col_cost.number_input("持有成本 (元)", value=0.0) if has_position else 0.0
+    
+    if st.button("🚀 掃描今日訊號", type="primary", key="btn_scan"):
+        with st.spinner('正在連線交易所獲取最新報價...'):
+            df_now = get_data(stock_input, date.today() - timedelta(days=200)) # 只要抓夠算指標的量就好
         
-        total_ret = (final_asset - safe_capital) / safe_capital * 100
-        net_profit = final_asset - safe_capital
-        
-        c1, c2, c3 = st.columns(3)
-        c1.metric("最終資產", f"${final_asset:,.0f}")
-        c2.metric("總損益", f"${net_profit:,.0f}", f"{total_ret:.2f}%")
-        c3.metric("總交易次數", f"{len(history)//2} 次")
-        
-        # --- 動態繪圖 ---
-        # 如果是區間或衝浪，需要兩個圖表 (Subplots)
-        rows = 2 if ("區間" in strategy or "衝浪" in strategy) else 1
-        row_heights = [0.7, 0.3] if rows == 2 else [1.0]
-        
-        fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, 
-                            vertical_spacing=0.05, row_heights=row_heights)
-        
-        # 主圖 (K線)
-        fig.add_trace(go.Scatter(x=df.index, y=df['CLOSE' if 'CLOSE' in df.columns else 'ADJCLOSE'], 
-                                 mode='lines', name='股價', line=dict(color='gray', width=1)), row=1, col=1)
-        
-        # 根據策略畫線
-        if "趨勢" in strategy or "快攻" in strategy:
-            fig.add_trace(go.Scatter(x=df.index, y=df['MA10'], name='MA10', line=dict(color='orange', width=1)), row=1, col=1)
-            fig.add_trace(go.Scatter(x=df.index, y=df['MA60'], name='MA60 (季線)', line=dict(color='green', width=2)), row=1, col=1)
-        elif "衝浪" in strategy:
-            fig.add_trace(go.Scatter(x=df.index, y=df['MA20'], name='MA20 (月線)', line=dict(color='blue', width=1.5)), row=1, col=1)
-            # 副圖 MACD
-            fig.add_trace(go.Bar(x=df.index, y=df['MACD_Hist'], name='MACD', marker_color=np.where(df['MACD_Hist']>0, 'red', 'green')), row=2, col=1)
-        elif "區間" in strategy:
-            if enable_range_stop:
-                fig.add_trace(go.Scatter(x=df.index, y=df['Box_Low'], name='支撐線', line=dict(color='red', dash='dash')), row=1, col=1)
-            # 副圖 KD
-            fig.add_trace(go.Scatter(x=df.index, y=df['K'], name='K值', line=dict(color='purple')), row=2, col=1)
-            fig.add_hline(y=80, line_dash="dash", line_color="green", row=2, col=1)
-            fig.add_hline(y=20, line_dash="dash", line_color="red", row=2, col=1)
+        if df_now is not None:
+            df_now = calculate_indicators(df_now)
+            last = df_now.iloc[-1]
+            curr_price = last['CLOSE' if 'CLOSE' in df_now.columns else 'ADJCLOSE']
+            
+            # --- 數據驗證區 ---
+            with st.expander("🔍 數據驗證 (點此核對券商軟體)"):
+                st.write(f"**資料日期：** {last.name.date()}")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("最新收盤價", f"{curr_price:.2f}")
+                c2.metric("MA60 (季線)", f"{last['MA60']:.2f}")
+                if "趨勢" in strategy: c3.metric("MA10 (短線)", f"{last['MA10']:.2f}")
+                if "區間" in strategy: c3.metric("K值 (KD)", f"{last['K']:.2f}")
+                if "衝浪" in strategy: c3.metric("MA20 (月線)", f"{last['MA20']:.2f}")
 
-        # 買賣點標記
-        fig.add_trace(go.Scatter(x=buy_x, y=buy_y, mode='markers', name='買進', marker=dict(symbol='triangle-up', size=10, color='red')), row=1, col=1)
-        fig.add_trace(go.Scatter(x=sell_x, y=sell_y, mode='markers', name='賣出', marker=dict(symbol='triangle-down', size=10, color='green')), row=1, col=1)
+            # --- 訊號判讀邏輯 (只判斷最後一天) ---
+            advice = "無動作"; color = "grey"; details = ""
+            
+            if "趨勢" in strategy:
+                if has_position:
+                    stop_price = my_cost * (1 - stop_loss/100) if my_cost > 0 else 0
+                    if curr_price <= stop_price: advice = "🛑 停損賣出"; color = "red"; details = f"觸發 {stop_loss}% 停損"
+                    elif curr_price < last['MA60']: advice = "📉 趨勢轉弱賣出"; color = "red"; details = "收盤跌破季線"
+                    else: advice = "✅ 續抱"; color = "green"; details = "趨勢向上且未達停損"
+                else:
+                    if last['MA10'] > last['MA60'] and curr_price > last['MA60']: advice = "⚡ 買進"; color = "red"; details = "MA10 黃金交叉 MA60"
+                    else: advice = "💤 觀望"; color = "gray"; details = "等待均線交叉"
 
-        fig.update_layout(title=f"{st.session_state.stock_name} - {strategy}", height=600, xaxis_rangeslider_visible=False)
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # --- 戰術指引 ---
-        st.subheader("📋 指揮官戰術報告")
-        last = df.iloc[-1]
-        curr = last['CLOSE' if 'CLOSE' in df.columns else 'ADJCLOSE']
-        advice = "無動作"; color = "grey"
-        
-        # 這裡為了簡潔，只列出快攻的邏輯，其他邏輯同 V27
-        if "快攻" in strategy:
-            if has_position:
-                cost = my_cost if my_cost > 0 else curr
-                tp_price = cost * (1 + take_profit/100)
-                sl_price = cost * (1 - stop_loss/100)
-                st.info(f"監控中 | 停利目標: {tp_price:.1f} | 停損防線: {sl_price:.1f}")
-                
-                if curr >= tp_price: advice = f"💰 停利 (+{take_profit}%)"; color="green"
-                elif curr <= sl_price: advice = "🛑 停損"; color="red"
-                elif curr < last['MA60']: advice = "📉 破季線"; color="red"
-                else: advice = "✅ 續抱"; color="green"
-            else:
-                if curr > last['MA60'] and df['CLOSE' if 'CLOSE' in df.columns else 'ADJCLOSE'].iloc[-2] < df['MA60'].iloc[-2]:
-                    advice = "⚡ 買進 (突破季線)"; color="red"
-                else: advice = "💤 觀望"; color="gray"
-        
-        # (為節省篇幅，其他策略邏輯請參考 V27，程式碼中已包含基礎邏輯)
-        # 若是其他策略，這裡用簡單邏輯填充顯示
-        elif has_position:
-             advice = "✅ 續抱 (依照線圖操作)"; color="green"
+            elif "快攻" in strategy:
+                if has_position:
+                    tp_price = my_cost * (1 + take_profit/100)
+                    sl_price = my_cost * (1 - stop_loss/100)
+                    if curr_price >= tp_price: advice = "💰 獲利了結"; color = "green"; details = f"達成 {take_profit}% 停利目標"
+                    elif curr_price <= sl_price: advice = "🛑 停損賣出"; color = "red"; details = f"觸發 {stop_loss}% 停損"
+                    elif curr_price < last['MA60']: advice = "📉 破線賣出"; color = "red"; details = "跌破季線防守點"
+                    else: advice = "✅ 續抱"; color = "green"; details = "未達停利/停損點"
+                else:
+                    prev_p = df_now['CLOSE' if 'CLOSE' in df_now.columns else 'ADJCLOSE'].iloc[-2]
+                    prev_m60 = df_now['MA60'].iloc[-2]
+                    if curr_price > last['MA60'] and prev_p < prev_m60: advice = "⚡ 買進"; color = "red"; details = "股價強勢突破季線"
+                    else: advice = "💤 觀望"; color = "gray"; details = "等待突破季線"
+            
+            # 其他策略邏輯省略，原理相同...
+            elif "區間" in strategy and not has_position and last['K'] < 20: advice = "⚡ 買進"; color="red"; details="KD 低檔超賣"
+            elif "區間" in strategy and has_position and last['K'] > 80: advice = "📉 賣出"; color="green"; details="KD 高檔超買"
+            elif "衝浪" in strategy and not has_position and last['MACD_Hist'] > 0 and df_now['MACD_Hist'].iloc[-2] < 0: advice = "⚡ 買進"; color="red"; details="MACD 翻紅"
+            elif "衝浪" in strategy and has_position and curr_price < last['MA20']: advice = "📉 賣出"; color="red"; details="跌破月線"
+            elif has_position: advice = "✅ 續抱"; color="green"; details="未出現賣訊"
+            else: advice = "💤 觀望"; color="gray"; details="無進場訊號"
+
+            # --- 顯示巨大指令卡 ---
+            st.divider()
+            st.markdown(f"<h1 style='text-align: center; color: {color};'>{advice}</h1>", unsafe_allow_html=True)
+            st.markdown(f"<p style='text-align: center;'>戰術理由: {details}</p>", unsafe_allow_html=True)
+            st.divider()
+            
+            # 只畫最近半年的圖 (聚焦當下)
+            fig_now = go.Figure()
+            fig_now.add_trace(go.Scatter(x=df_now.index, y=df_now['CLOSE' if 'CLOSE' in df_now.columns else 'ADJCLOSE'], mode='lines', name='股價', line=dict(color='gray')))
+            fig_now.add_trace(go.Scatter(x=df_now.index, y=df_now['MA60'], mode='lines', name='MA60', line=dict(color='green', width=2)))
+            if "趨勢" in strategy: fig_now.add_trace(go.Scatter(x=df_now.index, y=df_now['MA10'], mode='lines', name='MA10', line=dict(color='orange')))
+            fig_now.update_layout(height=400, title="近期走勢圖 (近180日)", xaxis_rangeslider_visible=False)
+            st.plotly_chart(fig_now, use_container_width=True)
+
         else:
-             advice = "💤 觀望"; color="gray"
+            st.error("❌ 讀取失敗，請確認代碼。")
 
-        st.markdown(f"### 指令：:{color}[{advice}]")
+# ------------------------------------------------------------------
+# 分頁 2: 歷史回測 (詳細數據研究)
+# ------------------------------------------------------------------
+with tab2:
+    st.header("🧪 歷史戰略研發室")
+    
+    col_cap, col_date = st.columns(2)
+    capital = col_cap.number_input("回測本金", value=450000, step=10000)
+    start_date = col_date.date_input("回測開始日", value=date(2020, 1, 1))
+    
+    if st.button("📊 執行完整回測", key="btn_backtest"):
+        with st.spinner('正在進行歷史推演...'):
+            df_hist = get_data(stock_input, start_date)
         
-        with st.expander("查看詳細交易紀錄"):
-            for h in history: st.text(h)
-    else:
-        st.error("找不到該股票數據。")
+        if df_hist is not None:
+            df_hist = calculate_indicators(df_hist)
+            safe_capital = capital if capital > 0 else 10000
+            
+            final_asset, history, signals = run_backtest(df_hist, strategy, safe_capital, stop_loss, take_profit, enable_range_stop)
+            buy_x, buy_y, sell_x, sell_y = signals
+            
+            total_ret = (final_asset - safe_capital) / safe_capital * 100
+            net_profit = final_asset - safe_capital
+            
+            # 績效看板
+            m1, m2, m3 = st.columns(3)
+            m1.metric("最終資產", f"${final_asset:,.0f}")
+            m2.metric("總損益", f"${net_profit:,.0f}", f"{total_ret:.2f}%")
+            m3.metric("交易次數", f"{len(history)//2} 次")
+            
+            # 完整走勢圖
+            fig_hist = go.Figure()
+            fig_hist.add_trace(go.Scatter(x=df_hist.index, y=df_hist['CLOSE' if 'CLOSE' in df_hist.columns else 'ADJCLOSE'], mode='lines', name='股價', line=dict(color='gray', alpha=0.5)))
+            fig_hist.add_trace(go.Scatter(x=df_hist.index, y=df_hist['MA60'], mode='lines', name='季線', line=dict(color='green')))
+            fig_hist.add_trace(go.Scatter(x=buy_x, y=buy_y, mode='markers', name='買進', marker=dict(symbol='triangle-up', size=8, color='red')))
+            fig_hist.add_trace(go.Scatter(x=sell_x, y=sell_y, mode='markers', name='賣出', marker=dict(symbol='triangle-down', size=8, color='green')))
+            fig_hist.update_layout(height=500, title=f"完整歷史回測 ({start_date} ~ 至今)")
+            st.plotly_chart(fig_hist, use_container_width=True)
+            
+            with st.expander("查看詳細交易紀錄"):
+                for h in history: st.text(h)
+        else:
+            st.error("❌ 無法取得歷史數據。")
